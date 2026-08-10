@@ -1,0 +1,31 @@
+{
+  "name": "study-loop",
+  "version": "1.0.0",
+  "description": "Personal study loop: inbox.md → RemNote plugin → weekly report",
+  "type": "commonjs",
+  "scripts": {
+    "watch": "tsx scripts/watch.ts",
+    "report": "tsx scripts/weekly-report.ts",
+    "test": "jest --runInBand",
+    "test:watch": "jest --watch"
+  },
+  "dependencies": {
+    "chokidar": "^3.6.0",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "simple-git": "^3.22.0",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.11.5",
+    "@types/supertest": "^6.0.2",
+    "jest": "^29.7.0",
+    "supertest": "^6.3.4",
+    "ts-jest": "^29.1.2",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
+  }
+}
