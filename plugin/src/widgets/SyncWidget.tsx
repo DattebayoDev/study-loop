@@ -6,14 +6,8 @@
  * Mode 2 (push): reads all cards via plugin.card.getAll(), normalises review
  *   history since the stored cursor, POSTs to /reviews.
  *
- * VERIFIED SDK APIs ONLY — nothing is invented beyond the spec:
- *   plugin.rem.createSingleRemWithMarkdown, setBackText, setEnablePractice,
- *   addTag, findByName, findMany, getParentRem, isDocument, setText, setIsDocument,
- *   plugin.richText.text, toString,
- *   plugin.card.getAll, repetitionHistory,
- *   plugin.storage.setSynced, getSynced, getSession,
- *   plugin.settings.getSetting,
- *   plugin.app.toast.
+ * VERIFIED SDK APIs ONLY — nothing is invented beyond the spec.
+ * All API shapes confirmed against @remnote/plugin-sdk@0.0.46 types.
  *
  * LIMITATIONS (documented, not faked):
  *   • No per-review interval or ease — always null.
@@ -21,11 +15,11 @@
  *   • Tech path derived by walking getParentRem() up the Document chain; may be null.
  *   • review_id = `${card_id}:${date_ms}` — deduped client-side.
  */
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { renderWidget, usePlugin, useTracker } from '@remnote/remnote-lib';
-import type { RNPlugin, Rem } from '@remnote/remnote-lib';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { renderWidget, usePlugin, useTrackerPlugin } from '@remnote/plugin-sdk';
+import type { PluginRem, RNPlugin } from '@remnote/plugin-sdk';
 
-// ── Types (local to plugin, no shared src/) ───────────────────────────────────
+// ── Types ─────────────────────────────────────────────────────────────────────
 
 type Grade = 'again' | 'hard' | 'good' | 'easy' | 'other';
 
@@ -33,7 +27,6 @@ interface PendingCard {
   id: string;
   front: string;
   back: string;
-  techPath: string;
   techSegments: string[];
   concepts: string[];
 }
@@ -57,22 +50,34 @@ function mapScore(score: number): Grade {
   return 'other';
 }
 
+// ── Rich text helpers ─────────────────────────────────────────────────────────
+
+/** Build a RichTextInterface from a plain string. */
+async function rt(plugin: RNPlugin, text: string) {
+  return await plugin.richText.text(text).value();
+}
+
+/** Convert a Rem's rich text to a plain string (async in the real SDK). */
+async function remName(plugin: RNPlugin, rem: PluginRem): Promise<string> {
+  if (!rem.text) return '';
+  return await plugin.richText.toString(rem.text);
+}
+
 // ── Tech path resolution ──────────────────────────────────────────────────────
 
 /**
- * Walk getParentRem() from a card's Rem up to the knowledge-base root,
- * collecting Document names in order. Returns a /-joined path or null.
+ * Walk getParentRem() from a card's Rem up the tree, collecting Document names.
+ * Returns a /-joined path or null.
  */
-async function deriveTechPath(plugin: RNPlugin, rem: Rem): Promise<string | null> {
+async function deriveTechPath(plugin: RNPlugin, rem: PluginRem): Promise<string | null> {
   const segments: string[] = [];
-  let current: Rem | null | undefined = rem;
+  let current: PluginRem | undefined = rem;
 
-  // Guard against infinite loops (RemNote's tree has a finite depth)
   for (let i = 0; i < 20; i++) {
-    const parent = await current?.getParentRem();
+    const parent: PluginRem | undefined = await current?.getParentRem();
     if (!parent) break;
     if (await parent.isDocument()) {
-      const name = plugin.richText.toString(parent.text);
+      const name = await remName(plugin, parent);
       if (name) segments.unshift(name);
     }
     current = parent;
@@ -83,71 +88,63 @@ async function deriveTechPath(plugin: RNPlugin, rem: Rem): Promise<string | null
 
 /**
  * Find or create a Document Rem for one path segment.
- * - At the top level (parentRem === null): use plugin.rem.findByName.
- * - For nested segments: scan parentRem.children for a matching Document.
- * Always creates only the missing level, never duplicates.
+ * - parentId === null: top-level segment — search globally by name.
+ * - parentId !== null: scan the parent's children for a matching Document.
+ * Never duplicates an existing segment.
  */
 async function findOrCreateSegment(
   plugin: RNPlugin,
   segmentName: string,
-  parentRem: Rem | null
-): Promise<Rem> {
-  const nameRichText = [plugin.richText.text(segmentName)];
+  parentId: string | null
+): Promise<PluginRem> {
+  const nameRt = await rt(plugin, segmentName);
 
-  if (parentRem === null) {
-    // Top-level segment
-    const found = await plugin.rem.findByName(nameRichText, null);
+  if (parentId === null) {
+    const found = await plugin.rem.findByName(nameRt, null);
     if (found) return found;
-    const created = await plugin.rem.createRem();
+    const created = await plugin.rem.createSingleRemWithMarkdown(segmentName);
     if (!created) throw new Error(`Failed to create top-level rem: ${segmentName}`);
-    await created.setText(nameRichText);
     await created.setIsDocument(true);
     return created;
   }
 
-  // Nested segment — scan parent children
-  const childIds = (parentRem as unknown as { children?: string[] }).children ?? [];
-  const children = await plugin.rem.findMany(childIds);
+  // Nested: scan parent's children for an existing Document with this name
+  const parentRem = await plugin.rem.findOne(parentId);
+  if (!parentRem) throw new Error(`Parent rem not found: ${parentId}`);
+  const children = await parentRem.getChildrenRem();
   for (const child of children) {
-    if (!child) continue;
-    const childName = plugin.richText.toString(child.text);
-    if (childName === segmentName && (await child.isDocument())) {
-      return child;
-    }
+    const name = await remName(plugin, child);
+    if (name === segmentName && (await child.isDocument())) return child;
   }
 
-  // Not found → create under parent
-  const created = await plugin.rem.createRem();
-  if (!created) throw new Error(`Failed to create rem: ${segmentName}`);
-  await created.setText(nameRichText);
+  // Not found — create as child of parentId
+  const created = await plugin.rem.createSingleRemWithMarkdown(segmentName, parentId);
+  if (!created) throw new Error(`Failed to create child rem: ${segmentName}`);
   await created.setIsDocument(true);
-  // setParent not in the spec but createRem accepts a parentId option via createSingleRemWithMarkdown;
-  // we use findByName path to avoid needing setParent directly.
-  // Workaround: create as child by using createSingleRemWithMarkdown under the parent.
-  const childRem = await plugin.rem.createSingleRemWithMarkdown(segmentName, parentRem._id);
-  if (!childRem) throw new Error(`Failed to create child rem: ${segmentName}`);
-  await childRem.setIsDocument(true);
-  return childRem;
+  return created;
 }
 
-/** Resolve the full tech path, creating any missing Document levels. */
-async function resolveTechPath(plugin: RNPlugin, segments: string[]): Promise<Rem> {
-  let current: Rem | null = null;
+/** Walk all segments, creating only the missing Document levels. */
+async function resolveTechPath(plugin: RNPlugin, segments: string[]): Promise<PluginRem> {
+  let currentId: string | null = null;
+  let current: PluginRem | null = null;
   for (const segment of segments) {
-    current = await findOrCreateSegment(plugin, segment, current);
+    const found = await findOrCreateSegment(plugin, segment, currentId);
+    currentId = found._id;
+    current = found;
   }
-  if (!current) throw new Error('Empty tech path');
+  if (!current) throw new Error('Empty tech path segments');
   return current;
 }
 
 /** Find or create a top-level concept tag Rem (e.g. "resilience"). */
-async function findOrCreateConceptTag(plugin: RNPlugin, conceptName: string): Promise<Rem> {
-  const nameRichText = [plugin.richText.text(conceptName)];
-  const found = await plugin.rem.findByName(nameRichText, null);
+async function findOrCreateConceptTag(plugin: RNPlugin, conceptName: string): Promise<PluginRem> {
+  const nameRt = await rt(plugin, conceptName);
+  const found = await plugin.rem.findByName(nameRt, null);
   if (found) return found;
   const created = await plugin.rem.createRem();
   if (!created) throw new Error(`Failed to create concept tag: ${conceptName}`);
-  await created.setText(nameRichText);
+  await created.setText(await rt(plugin, conceptName));
   return created;
 }
 
@@ -193,22 +190,19 @@ async function runCreateCards(
 
   for (const card of pending) {
     try {
-      // Resolve or create the tech path Document hierarchy
       const parentDoc = await resolveTechPath(plugin, card.techSegments);
 
-      // Create the flashcard under the deepest path Document
       const rem = await plugin.rem.createSingleRemWithMarkdown(card.front, parentDoc._id);
-      if (!rem) throw new Error('createSingleRemWithMarkdown returned null');
-      await rem.setBackText([plugin.richText.text(card.back)]);
+      if (!rem) throw new Error('createSingleRemWithMarkdown returned undefined');
+
+      await rem.setBackText(await rt(plugin, card.back));
       await rem.setEnablePractice(true);
 
-      // Apply concept tags (cross-cutting metadata — card stays in tech folder)
       for (const concept of card.concepts) {
         const tagRem = await findOrCreateConceptTag(plugin, concept);
         await rem.addTag(tagRem);
       }
 
-      // Confirm with the watcher (archives line, records id, removes from inbox)
       await postProcessed(baseUrl, card.id);
       created++;
       onProgress(`Created: ${card.front}`);
@@ -231,7 +225,7 @@ async function runCaptureReviews(
   onProgress: (msg: string) => void
 ): Promise<{ found: number; errors: string[] }> {
   const cursorKey = 'reviewCursor';
-  const cursor = (await plugin.storage.getSynced<number>(cursorKey)) ?? null;
+  const cursor = await plugin.storage.getSynced<number>(cursorKey) ?? null;
 
   const allCards = await plugin.card.getAll();
   onProgress(`Scanning ${allCards.length} card(s) for new reviews`);
@@ -245,35 +239,29 @@ async function runCaptureReviews(
       ? history.filter(h => h.date > cursor)
       : history;
 
-    if (newHistory.length > 0) {
-      // Derive tech path by walking parent chain
-      let techPath: string | null = null;
-      const concepts: string[] = [];
-      try {
-        const rem = await card.getRem();
-        if (rem) {
-          techPath = await deriveTechPath(plugin, rem);
-          // Concepts come from the rem's tags. In RemNote, tags are rems that have been
-          // applied via addTag() — we read them back via the rem's powerup data.
-          // The SDK does not expose a direct getTags() — we skip concept derivation here
-          // and rely on the card_metas stored when the card was first created.
-        }
-      } catch { /* tech path derivation is best-effort */ }
+    if (newHistory.length === 0) continue;
 
-      cardMetas.push({ card_id: card._id, tech_path: techPath, concepts });
+    let techPath: string | null = null;
+    try {
+      const rem = await card.getRem();
+      if (rem) techPath = await deriveTechPath(plugin, rem);
+    } catch { /* best-effort */ }
 
-      for (const h of newHistory) {
-        reviews.push({
-          review_id: `${card._id}:${h.date}`,
-          card_id: card._id,
-          reviewed_at: new Date(h.date).toISOString(),
-          grade: mapScore(h.score),
-          rating: h.score,
-          response_time_ms: h.responseTime ?? null,
-          interval: null,
-          ease: null,
-        });
-      }
+    // Concepts are stored when cards are created (addTag). The SDK has no getTags() method,
+    // so we emit an empty array here; the watcher merges with metadata stored at creation time.
+    cardMetas.push({ card_id: card._id, tech_path: techPath, concepts: [] });
+
+    for (const h of newHistory) {
+      reviews.push({
+        review_id: `${card._id}:${h.date}`,
+        card_id: card._id,
+        reviewed_at: new Date(h.date).toISOString(),
+        grade: mapScore(h.score),
+        rating: h.score,
+        response_time_ms: h.responseTime ?? null,
+        interval: null,
+        ease: null,
+      });
     }
   }
 
@@ -285,7 +273,6 @@ async function runCaptureReviews(
       reviews,
       cards: cardMetas,
     });
-    // Advance cursor to now
     await plugin.storage.setSynced(cursorKey, Date.now());
   }
 
@@ -295,7 +282,7 @@ async function runCaptureReviews(
 
 // ── React component ───────────────────────────────────────────────────────────
 
-function SyncWidgetComponent(): JSX.Element {
+function SyncWidgetComponent() {
   const plugin = usePlugin();
   const [status, setStatus] = useState<SyncStatus>({
     phase: 'idle',
@@ -308,8 +295,8 @@ function SyncWidgetComponent(): JSX.Element {
   const [log, setLog] = useState<string[]>([]);
   const isSyncing = useRef(false);
 
-  // Watch for trigger from the command palette
-  const syncTrigger = useTracker(
+  // Watch for trigger from the command palette via session storage
+  const syncTrigger = useTrackerPlugin(
     async (rp) => await rp.storage.getSession<number>('syncTrigger'),
     []
   );
@@ -330,7 +317,7 @@ function SyncWidgetComponent(): JSX.Element {
 
     try {
       const baseUrl = await getBaseUrl();
-      const userId = (await plugin.settings.getSetting<string>('userId')) ?? 'me';
+      const userId = await plugin.settings.getSetting<string>('userId') ?? 'me';
 
       setStatus(s => ({ ...s, phase: 'pulling', errors: [] }));
       progress('── Mode 1: creating pending cards ──');
@@ -434,7 +421,7 @@ function SyncWidgetComponent(): JSX.Element {
       </div>
     </div>
   );
-}
+};
 
 renderWidget(SyncWidgetComponent);
 

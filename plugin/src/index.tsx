@@ -11,8 +11,7 @@
  * no RemNote background scheduler — if you close the sidebar the interval
  * stops. Use the command palette command as a manual trigger anytime.
  */
-import { declareIndexPlugin, ReactRNPlugin, WidgetLocation } from '@remnote/remnote-lib';
-import { SyncWidget } from './widgets/SyncWidget';
+import { declareIndexPlugin, ReactRNPlugin, WidgetLocation } from '@remnote/plugin-sdk';
 
 async function onActivate(plugin: ReactRNPlugin): Promise<void> {
   // ── Settings ─────────────────────────────────────────────────────────────
