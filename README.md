@@ -86,8 +86,11 @@ The watcher:
 
 ### 4. Install the RemNote plugin
 
+The plugin lives in its own repo: [study-loop-plugin](https://github.com/DattebayoDev/study-loop-plugin) (kept separate so the code submitted for RemNote's marketplace review doesn't include this repo's personal card/report data).
+
 ```bash
-cd plugin
+git clone https://github.com/DattebayoDev/study-loop-plugin
+cd study-loop-plugin
 npm install
 npm run dev   # starts Vite dev server on localhost:8000
 ```
